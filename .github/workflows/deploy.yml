@@ -1,0 +1,126 @@
+name: Deploy Frontend to S3 and CloudFront
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: frontend-production
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    env:
+      AWS_REGION: ${{ secrets.AWS_REGION }}
+      S3_BUCKET_NAME: ${{ secrets.S3_BUCKET_NAME }}
+      CLOUDFRONT_DISTRIBUTION_ID: ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 22 LTS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+      - name: Export static files if required
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -f next.config.js ] || [ -f next.config.mjs ] || [ -f next.config.cjs ]; then
+            echo "Next.js configuration detected."
+
+            if npm pkg get scripts.export 2>/dev/null | grep -q '"export"'; then
+              echo "Running static export script."
+              npm run export
+            else
+              echo "No export script found. If this project uses Next.js static export, ensure the build step generates out/."
+            fi
+          else
+            echo "No Next.js configuration detected. Skipping static export step."
+          fi
+
+      - name: Resolve deployment directory
+        id: resolve_dir
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ -d "out" ]; then
+            DEPLOY_DIR="out"
+          elif [ -d "dist" ]; then
+            DEPLOY_DIR="dist"
+          else
+            echo "Neither out/ nor dist/ was found after the build."
+            ls -la
+            exit 1
+          fi
+
+          echo "Using deployment directory: ${DEPLOY_DIR}"
+          echo "deploy_dir=${DEPLOY_DIR}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Sync files to S3
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Syncing frontend/${{ steps.resolve_dir.outputs.deploy_dir }} to s3://${S3_BUCKET_NAME}"
+          aws s3 sync "${{ steps.resolve_dir.outputs.deploy_dir }}" "s3://${S3_BUCKET_NAME}" --delete --only-show-errors
+
+      - name: Create CloudFront invalidation
+        id: invalidation
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Creating CloudFront invalidation for distribution ${CLOUDFRONT_DISTRIBUTION_ID}"
+          INVALIDATION_ID=$(aws cloudfront create-invalidation \
+            --distribution-id "${CLOUDFRONT_DISTRIBUTION_ID}" \
+            --paths "/*" \
+            --query 'Invalidation.Id' \
+            --output text)
+
+          echo "Invalidation ID: ${INVALIDATION_ID}"
+          echo "invalidation_id=${INVALIDATION_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Deployment summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Deployment Summary"
+            echo "- Repository: ${{ github.repository }}"
+            echo "- Commit: ${{ github.sha }}"
+            echo "- Branch: ${{ github.ref_name }}"
+            echo "- Deployment directory: ${{ steps.resolve_dir.outputs.deploy_dir }}"
+            echo "- S3 bucket: ${S3_BUCKET_NAME}"
+            echo "- CloudFront distribution: ${CLOUDFRONT_DISTRIBUTION_ID}"
+            echo "- CloudFront invalidation: ${{ steps.invalidation.outputs.invalidation_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"
